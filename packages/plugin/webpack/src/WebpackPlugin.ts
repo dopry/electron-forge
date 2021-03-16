@@ -8,7 +8,9 @@ import http from 'http';
 import Logger, { Tab } from '@electron-forge/web-multi-logger';
 import path from 'path';
 import PluginBase from '@electron-forge/plugin-base';
-import webpack, { Configuration } from 'webpack';
+import webpack, {
+  Configuration, Stats, Watching,
+} from 'webpack';
 import webpackDevMiddleware from 'webpack-dev-middleware';
 import webpackHotMiddleware from 'webpack-hot-middleware';
 
@@ -31,7 +33,7 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
 
   private _configGenerator!: WebpackConfigGenerator;
 
-  private watchers: webpack.Compiler.Watching[] = [];
+  private watchers: Watching[] = [];
 
   private servers: http.Server[] = [];
 
@@ -41,17 +43,17 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
 
   private loggerPort = DEFAULT_LOGGER_PORT;
 
-  constructor(c: WebpackPluginConfig) {
-    super(c);
+  constructor(config: WebpackPluginConfig) {
+    super(config);
 
-    if (c.port) {
-      if (this.isValidPort(c.port)) {
-        this.port = c.port;
+    if (config.port) {
+      if (this.isValidPort(config.port)) {
+        this.port = config.port;
       }
     }
-    if (c.loggerPort) {
-      if (this.isValidPort(c.loggerPort)) {
-        this.loggerPort = c.loggerPort;
+    if (config.loggerPort) {
+      if (this.isValidPort(config.loggerPort)) {
+        this.loggerPort = config.loggerPort;
       }
     }
 
@@ -59,7 +61,7 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
     this.getHook = this.getHook.bind(this);
   }
 
-  private isValidPort = (port: number) => {
+  private isValidPort(port: number) {
     if (port < 1024) {
       throw new Error(`Cannot specify port (${port}) below 1024, as they are privileged`);
     } else if (port > 65535) {
@@ -69,7 +71,7 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
     }
   }
 
-  private exitHandler = (options: { cleanup?: boolean; exit?: boolean }, err?: Error) => {
+  private exitHandler(options: { cleanup?: boolean; exit?: boolean }, err?: Error) {
     d('handling process exit with:', options);
     if (options.cleanup) {
       for (const watcher of this.watchers) {
@@ -94,30 +96,31 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
 
   async writeJSONStats(
     type: string,
-    stats: webpack.Stats,
-    statsOptions?: webpack.Stats.ToStringOptions,
+    stats: Stats,
+    statsOptions?: any, // TODO: change that
   ): Promise<void> {
     d(`Writing JSON stats for ${type} config`);
-    const jsonStats = stats.toJson(statsOptions as webpack.Stats.ToJsonOptions);
+    const jsonStats = stats.toJson(statsOptions);
     const jsonStatsFilename = path.resolve(this.baseDir, type, 'stats.json');
     await fs.writeJson(jsonStatsFilename, jsonStats, { spaces: 2 });
   }
 
-  // eslint-disable-next-line max-len
-  private runWebpack = async (options: Configuration, isRenderer = false): Promise<webpack.Stats> => new Promise((resolve, reject) => {
-    webpack(options)
-      .run(async (err, stats) => {
-        if (isRenderer && this.config.renderer.jsonStats) {
-          await this.writeJSONStats('renderer', stats, options.stats);
-        }
+  private async runWebpack(options: Configuration): Promise<Stats> {
+    const compiler = webpack(options);
+    return new Promise((resolve, reject) => {
+      compiler.run(async (err, stats) => {
         if (err) {
           return reject(err);
         }
+        if (stats === undefined) {
+          return reject(new Error("No Webpack Stats, this shouldn't happen"));
+        }
         return resolve(stats);
       });
-  });
+    });
+  }
 
-  init = (dir: string) => {
+  init(dir: string) {
     this.setDirectories(dir);
 
     d('hooking process events');
@@ -125,7 +128,7 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
     process.on('SIGINT' as NodeJS.Signals, (_signal) => this.exitHandler({ exit: true }));
   }
 
-  setDirectories = (dir: string) => {
+  setDirectories(dir: string) {
     this.projectDir = dir;
     this.baseDir = path.resolve(dir, '.webpack');
   }
@@ -170,15 +173,15 @@ export default class WebpackPlugin extends PluginBase<WebpackPluginConfig> {
           });
         };
       case 'resolveForgeConfig':
-        return this.resolveForgeConfig;
+        return async (forgeConfig: ForgeConfig) => this.resolveForgeConfig(forgeConfig);
       case 'packageAfterCopy':
-        return this.packageAfterCopy;
+        return async (_: any, buildPath: string) => this.packageAfterCopy(_, buildPath);
       default:
         return null;
     }
   }
 
-  resolveForgeConfig = async (forgeConfig: ForgeConfig) => {
+  async resolveForgeConfig(forgeConfig: ForgeConfig) {
     if (!forgeConfig.packagerConfig) {
       forgeConfig.packagerConfig = {};
     }
@@ -204,7 +207,7 @@ Your packaged app may be larger than expected if you dont ignore everything othe
     return forgeConfig;
   }
 
-  packageAfterCopy = async (_: any, buildPath: string) => {
+  async packageAfterCopy(_: any, buildPath: string) {
     const pj = await fs.readJson(path.resolve(this.projectDir, 'package.json'));
     if (pj.config) {
       delete pj.config.forge;
@@ -225,18 +228,27 @@ Your packaged app may be larger than expected if you dont ignore everything othe
     await fs.mkdirp(path.resolve(buildPath, 'node_modules'));
   }
 
-  compileMain = async (watch = false, logger?: Logger) => {
+  async compileMain(watch = false, logger?: Logger) {
     let tab: Tab;
     if (logger) {
       tab = logger.createTab('Main Process');
     }
+
     await asyncOra('Compiling Main Process Code', async () => {
       const mainConfig = await this.configGenerator.getMainConfig();
-      await new Promise((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         const compiler = webpack(mainConfig);
         const [onceResolve, onceReject] = once(resolve, reject);
-        const cb: webpack.ICompiler.Handler = async (err, stats: webpack.Stats) => {
-          if (tab && stats) {
+        const cb = async (err: any, stats: Stats | undefined) => {
+          if (err) {
+            return onceReject(err);
+          }
+
+          if (stats === undefined) {
+            return onceReject(new Error("No Webpack Stats, this shouldn't happen"));
+          }
+
+          if (tab) {
             tab.log(stats.toString({
               colors: true,
             }));
@@ -245,13 +257,13 @@ Your packaged app may be larger than expected if you dont ignore everything othe
             await this.writeJSONStats('main', stats, mainConfig.stats);
           }
 
-          if (err) return onceReject(err);
           if (!watch && stats.hasErrors()) {
             return onceReject(new Error(`Compilation errors in the main process: ${stats.toString()}`));
           }
 
           return onceResolve();
         };
+
         if (watch) {
           this.watchers.push(compiler.watch({}, cb));
         } else {
@@ -261,12 +273,14 @@ Your packaged app may be larger than expected if you dont ignore everything othe
     });
   }
 
-  compileRenderers = async (watch = false) => { // eslint-disable-line @typescript-eslint/no-unused-vars, max-len
+  async compileRenderers(watch = false) {
     await asyncOra('Compiling Renderer Template', async () => {
-      const stats = await this.runWebpack(
-        await this.configGenerator.getRendererConfig(this.config.renderer.entryPoints),
-        true,
-      );
+      const options = await this.configGenerator
+        .getRendererConfig(this.config.renderer.entryPoints);
+      const stats = await this.runWebpack(options);
+      if (this.config.renderer.jsonStats) {
+        await this.writeJSONStats('renderer', stats, options.stats);
+      }
       if (!watch && stats.hasErrors()) {
         throw new Error(`Compilation errors in the renderer: ${stats.toString()}`);
       }
@@ -275,9 +289,9 @@ Your packaged app may be larger than expected if you dont ignore everything othe
     for (const entryPoint of this.config.renderer.entryPoints) {
       if (entryPoint.preload) {
         await asyncOra(`Compiling Renderer Preload: ${entryPoint.name}`, async () => {
-          await this.runWebpack(
-            await this.configGenerator.getPreloadRendererConfig(entryPoint, entryPoint.preload!),
-          );
+          const options = await this.configGenerator
+            .getPreloadRendererConfig(entryPoint, entryPoint.preload!);
+          await this.runWebpack(options);
         });
       }
     }
@@ -289,20 +303,18 @@ Your packaged app may be larger than expected if you dont ignore everything othe
 
       const config = await this.configGenerator.getRendererConfig(this.config.renderer.entryPoints);
       const compiler = webpack(config);
-      const server = webpackDevMiddleware(compiler, {
-        logger: {
-          debug: tab.log.bind(tab),
-          log: tab.log.bind(tab),
-          info: tab.log.bind(tab),
-          error: tab.log.bind(tab),
-          warn: tab.log.bind(tab),
-        },
-        publicPath: '/',
-        hot: true,
-        historyApiFallback: true,
-        writeToDisk: true,
-      } as any);
       const app = express();
+      const server = webpackDevMiddleware(compiler, {
+        publicPath: '/',
+        writeToDisk: true,
+      });
+
+      const wpLogger = compiler.getInfrastructureLogger('webpack-dev-server');
+      wpLogger.debug = tab.log.bind(tab);
+      wpLogger.log = tab.log.bind(tab);
+      wpLogger.info = tab.log.bind(tab);
+      wpLogger.error = tab.log.bind(tab);
+      wpLogger.warn = tab.log.bind(tab);
       app.use(server);
       app.use(webpackHotMiddleware(compiler));
       this.servers.push(app.listen(this.port));
@@ -315,7 +327,7 @@ Your packaged app may be larger than expected if you dont ignore everything othe
             entryPoint,
             entryPoint.preload!,
           );
-          await new Promise((resolve, reject) => {
+          await new Promise<void>((resolve, reject) => {
             const tab = logger.createTab(`${entryPoint.name} - Preload`);
             const [onceResolve, onceReject] = once(resolve, reject);
 
@@ -325,7 +337,6 @@ Your packaged app may be larger than expected if you dont ignore everything othe
                   colors: true,
                 }));
               }
-
               if (err) return onceReject(err);
               return onceResolve();
             }));
