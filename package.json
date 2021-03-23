@@ -132,7 +132,7 @@
     "eslint-plugin-mocha": "^8.0.0",
     "fetch-mock": "^9.10.7",
     "generate-changelog": "^1.8.0",
-    "globby": "^11.0.1",
+    "globby": "^11.0.3",
     "husky": "^4.3.0",
     "lint-staged": "^10.4.0",
     "listr": "^0.14.1",
